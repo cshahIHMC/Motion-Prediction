@@ -9,12 +9,12 @@ from typing import List, Tuple, Dict, Optional
 # Device helpers
 # ---------------------------------------------------------------------------
 
-def to_device(x: torch.Tensor) -> torch.Tensor:
+def ToDevice(x: torch.Tensor) -> torch.Tensor:
     """Move a tensor to GPU if available, otherwise keep on CPU."""
     return x.cuda() if torch.cuda.is_available() else x
 
 
-def item(value: torch.Tensor) -> torch.Tensor:
+def Item(value: torch.Tensor) -> torch.Tensor:
     """Detach a tensor from the computation graph and move to CPU."""
     return value.detach().cpu()
 
@@ -159,7 +159,110 @@ def plot_predictions(
         plt.tight_layout()
         plt.show()
 
+def plot_prediction(dataloader, model, col_names, full_dataset, plot_save_name=None):
+    model.eval()
 
+    ground_truth = []
+    preds = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            Predictor_input, Predictor_output = batch
+
+            Predictor_input_gpu = ToDevice(Predictor_input)
+            Predictor_input_gpu_flat = Predictor_input_gpu.reshape(Predictor_input_gpu.shape[0], -1)
+
+            Predictor_output = Predictor_output.squeeze(-1)
+            Predictor_output_gpu = ToDevice(Predictor_output)
+
+     
+            y_pred = model(Predictor_input_gpu)
+
+
+            output_np = Item(Predictor_output_gpu).numpy()
+            pred_np = Item(y_pred).numpy()
+
+            preds.append(pred_np)
+            ground_truth.append(output_np)
+
+    # Concatenate all batch outputs
+    pred_all = np.concatenate(preds, axis=0)
+    ground_truth_all = np.concatenate(ground_truth, axis=0)
+
+    # Unnormalize
+    pred_all_unnormalized = pred_all * full_dataset.output_std.to_numpy() + full_dataset.output_mean.to_numpy()
+    ground_truth_all_unnormalized = ground_truth_all * full_dataset.output_std.to_numpy() + full_dataset.output_mean.to_numpy()
+
+    # Metrics
+    abs_errors = np.abs(pred_all_unnormalized - ground_truth_all_unnormalized)
+    mae_per_joint_per_channel = abs_errors.mean(axis=0)
+    squared_errors = (pred_all_unnormalized - ground_truth_all_unnormalized) ** 2
+    rmse_per_joint_per_channel = np.sqrt(squared_errors.mean(axis=0))
+    std_per_joint_per_channel = abs_errors.std(axis=0)
+
+    joints = col_names  # Expected length: 28
+
+    # Print results
+    for joint_idx, joint in enumerate(joints):
+        print(f"Joint {joint} MAE = {mae_per_joint_per_channel[joint_idx]:.4f}, "
+              f"STD = {std_per_joint_per_channel[joint_idx]:.4f}, "
+              f"RMSE = {rmse_per_joint_per_channel[joint_idx]:.4f}")
+
+    # ── Index slices ──────────────────────────────────────────────
+    EMG_IDX     = slice(0, 8)       # features  0 –  7
+    ANGLE_IDX   = slice(8, 18)      # features  8 – 17
+    MOMENT_IDX  = slice(18, 28)     # features 18 – 27
+
+    groups = [
+        ("EMG Channels",  EMG_IDX,    2, 4),   # 2 rows × 4 cols
+        ("Joint Angles",  ANGLE_IDX,  2, 5),   # 2 rows × 5 cols
+        ("Joint Moments", MOMENT_IDX, 2, 5),   # 2 rows × 5 cols
+    ]
+
+    for group_title, idx_slice, rows, cols in groups:
+        feat_indices = list(range(*idx_slice.indices(28)))
+        n_feats = len(feat_indices)
+
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.5, rows * 3.5), sharex=True)
+        axes = axes.flatten()
+        fig.suptitle(group_title, fontsize=14, fontweight="bold", y=1.01)
+
+        for i, feat_idx in enumerate(feat_indices):
+            ax = axes[i]
+            ax.plot(pred_all_unnormalized[:, feat_idx],
+                    label="Prediction", linewidth=1.2, color="red")
+            ax.plot(ground_truth_all_unnormalized[:, feat_idx],
+                    label="Ground Truth", linewidth=1.0, color="black", alpha=0.7)
+            ax.set_title(joints[feat_idx], fontsize=9)
+
+            # MAE annotation in corner
+            ax.annotate(f"MAE={mae_per_joint_per_channel[feat_idx]:.3f}",
+                        xy=(0.02, 0.95), xycoords="axes fraction",
+                        fontsize=7, va="top", color="dimgray")
+
+            if i == 0:
+                ax.legend(loc="upper right", fontsize=7)
+
+        # Hide unused subplots
+        for j in range(i + 1, len(axes)):
+            fig.delaxes(axes[j])
+
+        # Shared axis labels
+        fig.supxlabel("Time (samples)", fontsize=10)
+
+        # Y-axis label based on group
+        ylabel = {"EMG Channels": "EMG (mV)",
+                  "Joint Angles": "Angle (°)",
+                  "Joint Moments": "Moment (Nm)"}.get(group_title, "")
+        fig.supylabel(ylabel, fontsize=10)
+
+        plt.tight_layout()
+
+        if plot_save_name:
+            safe_title = group_title.replace(" ", "_").lower()
+            plt.savefig(f"{plot_save_name}_{safe_title}.png", dpi=150, bbox_inches="tight")
+
+        plt.show()
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -190,3 +293,5 @@ def compute_metrics(
         print(f"{name:<40}  MAE={mae[i]:.4f}  RMSE={rmse[i]:.4f}  STD={std[i]:.4f}")
 
     return {"mae": mae, "rmse": rmse, "std": std}
+
+
