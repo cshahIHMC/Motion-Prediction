@@ -54,5 +54,81 @@ class dataLoader_seq(Dataset):
 
         # return PAE_inputs_centered, Predictor_inputs, Predictor_outputs
         return inputs, outputs
-        
+
+
+class FLDDataset(Dataset):
+    """Sliding-window dataset for FLD training.
+
+    Returns windows of shape (window_size, obs_dim) where
+    window_size = history_horizon + forecast_horizon (e.g. 151 + 50 = 201).
+
+    The FLD model expects history_horizon to be an odd number so that its
+    Conv1d layers produce same-length outputs with symmetric padding.
+    Use history_horizon=151 to approximate "150 past samples".
+
+    Args:
+        df: DataFrame whose columns are the features to model.
+        history_horizon: Length of the input context window (must be odd).
+        forecast_horizon: Number of future steps the FLD predicts forward.
+        feature_set: Which columns to use.
+            'input'   – first 48 columns only (sensor → sensor reconstruction)
+            'output'  – columns 48-76 only (biomechanics → biomechanics reconstruction)
+            'all'     – all 76 columns (default, same-space reconstruction)
+            'cross'   – encoder sees 48 sensor cols, decoder reconstructs 28 bio cols
+    """
+
+    def __init__(self, df, history_horizon: int = 151, forecast_horizon: int = 50,
+                 feature_set: str = 'all'):
+        assert history_horizon % 2 == 1, (
+            f"history_horizon must be odd for FLD Conv1d compatibility (got {history_horizon})."
+        )
+        self.history_horizon = history_horizon
+        self.forecast_horizon = forecast_horizon
+        self.window_size = history_horizon + forecast_horizon
+        self.feature_set = feature_set
+
+        if feature_set == 'input':
+            raw_in = df.iloc[:, :48].values.astype('float32')
+            raw_out = raw_in
+        elif feature_set == 'output':
+            raw_in = df.iloc[:, 48:76].values.astype('float32')
+            raw_out = raw_in
+        elif feature_set == 'cross':
+            raw_in  = df.iloc[:, :48].values.astype('float32')   # 48 sensor cols
+            raw_out = df.iloc[:, 48:76].values.astype('float32') # 28 bio cols
+        else:  # 'all'
+            raw_in = df.values.astype('float32')
+            raw_out = raw_in
+
+        def _normalise(raw):
+            mean = raw.mean(axis=0)
+            std  = raw.std(axis=0)
+            std[std == 0] = 1.0
+            return (raw - mean) / std, mean, std
+
+        norm_in,  mean_in,  std_in  = _normalise(raw_in)
+        norm_out, mean_out, std_out = _normalise(raw_out)
+
+        self.input_dim  = raw_in.shape[1]
+        self.output_dim = raw_out.shape[1]
+        self.obs_dim    = self.input_dim  # kept for backward compat
+
+        self.mean_tensor     = torch.tensor(mean_in,  dtype=torch.float32)
+        self.std_tensor      = torch.tensor(std_in,   dtype=torch.float32)
+        self.out_mean_tensor = torch.tensor(mean_out, dtype=torch.float32)
+        self.out_std_tensor  = torch.tensor(std_out,  dtype=torch.float32)
+
+        self.data_in  = torch.tensor(norm_in,  dtype=torch.float32)
+        self.data_out = torch.tensor(norm_out, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.data_in) - self.window_size
+
+    def __getitem__(self, idx):
+        # Returns (input_window, output_window) each of shape (window_size, dim)
+        # The training loop unfolds each into forecast_horizon+1 sliding windows.
+        x = self.data_in [idx: idx + self.window_size]  # (W, input_dim)
+        y = self.data_out[idx: idx + self.window_size]  # (W, output_dim)
+        return x, y
+
 

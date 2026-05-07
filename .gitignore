@@ -12,6 +12,9 @@ Saved Models/
 # Data folder (large files — do not commit)
 Data/
 
+# Ignore logs and checkpoints
+runs/
+
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
