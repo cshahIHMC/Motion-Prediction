@@ -78,7 +78,14 @@ class FLDDataset(Dataset):
     """
 
     def __init__(self, df, history_horizon: int = 151, forecast_horizon: int = 50,
-                 feature_set: str = 'all'):
+                 feature_set: str = 'all', norm_stats: dict = None):
+        """
+        norm_stats: optional dict with keys 'mean_in', 'std_in', 'mean_out', 'std_out'
+                    (all np.ndarray float32).  When provided the dataset is normalised
+                    with these pre-computed stats instead of computing them from df.
+                    Use this when combining multiple files so all datasets share the
+                    same normalisation.
+        """
         assert history_horizon % 2 == 1, (
             f"history_horizon must be odd for FLD Conv1d compatibility (got {history_horizon})."
         )
@@ -88,16 +95,17 @@ class FLDDataset(Dataset):
         self.feature_set = feature_set
 
         if feature_set == 'input':
-            raw_in = df.iloc[:, :48].values.astype('float32')
+            raw_in  = df.iloc[:, :48].values.astype('float32')
             raw_out = raw_in
         elif feature_set == 'output':
-            raw_in = df.iloc[:, 48:76].values.astype('float32')
+            raw_in  = df.iloc[:, 48:76].values.astype('float32')
             raw_out = raw_in
         elif feature_set == 'cross':
-            raw_in  = df.iloc[:, :48].values.astype('float32')   # 48 sensor cols
-            raw_out = df.iloc[:, 48:76].values.astype('float32') # 28 bio cols
+            # Caller builds df as pd.concat([input_df (48 cols), output_df], axis=1).
+            raw_in  = df.iloc[:, :48].values.astype('float32')
+            raw_out = df.iloc[:, 48:].values.astype('float32')
         else:  # 'all'
-            raw_in = df.values.astype('float32')
+            raw_in  = df.values.astype('float32')
             raw_out = raw_in
 
         def _normalise(raw):
@@ -106,8 +114,14 @@ class FLDDataset(Dataset):
             std[std == 0] = 1.0
             return (raw - mean) / std, mean, std
 
-        norm_in,  mean_in,  std_in  = _normalise(raw_in)
-        norm_out, mean_out, std_out = _normalise(raw_out)
+        if norm_stats is not None:
+            mean_in  = norm_stats['mean_in'];  std_in  = norm_stats['std_in']
+            mean_out = norm_stats['mean_out']; std_out = norm_stats['std_out']
+            norm_in  = (raw_in  - mean_in)  / std_in
+            norm_out = (raw_out - mean_out) / std_out
+        else:
+            norm_in,  mean_in,  std_in  = _normalise(raw_in)
+            norm_out, mean_out, std_out = _normalise(raw_out)
 
         self.input_dim  = raw_in.shape[1]
         self.output_dim = raw_out.shape[1]
