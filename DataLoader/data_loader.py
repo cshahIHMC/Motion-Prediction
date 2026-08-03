@@ -57,10 +57,15 @@ class dataLoader_seq(Dataset):
 
 
 class FLDDataset(Dataset):
-    """Sliding-window dataset for FLD training.
+    """Context/future-split dataset for FLD training.
 
-    Returns windows of shape (window_size, obs_dim) where
-    window_size = history_horizon + forecast_horizon (e.g. 151 + 50 = 201).
+    Each sample is (context, future):
+      context: (obs_dim, history_horizon)   — rows [idx, idx+H), channels-first,
+               ready to feed the model directly.
+      future:  (forecast_horizon, out_dim)  — rows [idx+H, idx+H+K), the genuinely
+               future ground truth immediately following the context window.
+    The two never overlap: window_size = history_horizon + forecast_horizon rows
+    are consumed per sample (e.g. 151 + 50 = 201), split cleanly at H.
 
     The FLD model expects history_horizon to be an odd number so that its
     Conv1d layers produce same-length outputs with symmetric padding.
@@ -71,20 +76,29 @@ class FLDDataset(Dataset):
         history_horizon: Length of the input context window (must be odd).
         forecast_horizon: Number of future steps the FLD predicts forward.
         feature_set: Which columns to use.
-            'input'   – first 48 columns only (sensor → sensor reconstruction)
-            'output'  – columns 48-76 only (biomechanics → biomechanics reconstruction)
-            'all'     – all 76 columns (default, same-space reconstruction)
-            'cross'   – encoder sees 48 sensor cols, decoder reconstructs 28 bio cols
+            'input'   – first `input_dim` columns only (self-reconstruction)
+            'output'  – columns after `input_dim` only (self-reconstruction)
+            'all'     – every column in df (default, same-space reconstruction)
+            'cross'   – encoder sees the first `input_dim` columns, decoder
+                        reconstructs the remaining columns
     """
 
     def __init__(self, df, history_horizon: int = 151, forecast_horizon: int = 50,
-                 feature_set: str = 'all', norm_stats: dict = None):
+                 feature_set: str = 'all', norm_stats: dict = None, device=None,
+                 input_dim: int = 48):
         """
         norm_stats: optional dict with keys 'mean_in', 'std_in', 'mean_out', 'std_out'
                     (all np.ndarray float32).  When provided the dataset is normalised
                     with these pre-computed stats instead of computing them from df.
                     Use this when combining multiple files so all datasets share the
                     same normalisation.
+        device: optional torch device. When given, the (small) normalised tensors are
+                moved there at construction time so __getitem__ slices directly out of
+                GPU memory — avoids per-batch host→device copies and lets the DataLoader
+                run with num_workers=0 (CUDA tensors can't cross process boundaries).
+        input_dim: number of leading columns in `df` that make up the encoder input
+                   (everything after this is treated as output). Only used by the
+                   'input'/'output'/'cross' feature_sets.
         """
         assert history_horizon % 2 == 1, (
             f"history_horizon must be odd for FLD Conv1d compatibility (got {history_horizon})."
@@ -95,15 +109,15 @@ class FLDDataset(Dataset):
         self.feature_set = feature_set
 
         if feature_set == 'input':
-            raw_in  = df.iloc[:, :48].values.astype('float32')
+            raw_in  = df.iloc[:, :input_dim].values.astype('float32')
             raw_out = raw_in
         elif feature_set == 'output':
-            raw_in  = df.iloc[:, 48:76].values.astype('float32')
+            raw_in  = df.iloc[:, input_dim:].values.astype('float32')
             raw_out = raw_in
         elif feature_set == 'cross':
-            # Caller builds df as pd.concat([input_df (48 cols), output_df], axis=1).
-            raw_in  = df.iloc[:, :48].values.astype('float32')
-            raw_out = df.iloc[:, 48:].values.astype('float32')
+            # Caller builds df as [input columns] followed by [output columns].
+            raw_in  = df.iloc[:, :input_dim].values.astype('float32')
+            raw_out = df.iloc[:, input_dim:].values.astype('float32')
         else:  # 'all'
             raw_in  = df.values.astype('float32')
             raw_out = raw_in
@@ -135,14 +149,21 @@ class FLDDataset(Dataset):
         self.data_in  = torch.tensor(norm_in,  dtype=torch.float32)
         self.data_out = torch.tensor(norm_out, dtype=torch.float32)
 
+        if device is not None:
+            self.data_in  = self.data_in.to(device)
+            self.data_out = self.data_out.to(device)
+            self.mean_tensor     = self.mean_tensor.to(device)
+            self.std_tensor      = self.std_tensor.to(device)
+            self.out_mean_tensor = self.out_mean_tensor.to(device)
+            self.out_std_tensor  = self.out_std_tensor.to(device)
+
     def __len__(self):
         return len(self.data_in) - self.window_size
 
     def __getitem__(self, idx):
-        # Returns (input_window, output_window) each of shape (window_size, dim)
-        # The training loop unfolds each into forecast_horizon+1 sliding windows.
-        x = self.data_in [idx: idx + self.window_size]  # (W, input_dim)
-        y = self.data_out[idx: idx + self.window_size]  # (W, output_dim)
-        return x, y
+        H, K = self.history_horizon, self.forecast_horizon
+        context = self.data_in[idx: idx + H].T           # (input_dim, H)
+        future  = self.data_out[idx + H: idx + H + K]     # (K, output_dim) — strictly future rows
+        return context, future
 
 
