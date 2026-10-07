@@ -40,14 +40,14 @@ import os
 import numpy as np
 import pandas as pd
 
-DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data", "all_data.csv")
-OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data", "train_val_index.csv")
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data", "all_data_150_corrected.csv")
+OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Data", "train_val_index_150_corrected.csv")
 
 # --- constants used by the CLI entry point (`python3 build_train_val_index.py`) ---
 HISTORY_HORIZON = 151       # frames of past context per window (must be odd, matches FLDDataset)
-FORECAST_HORIZON = 50       # frames of future prediction horizon per window
+FORECAST_HORIZON = 20       # frames of future prediction horizon per window
 VAL_FRACTION = 0.15         # target fraction of windows assigned to validation
-NUM_VAL_SEGMENTS = 3        # target number of separate val regions spread across each trial
+NUM_VAL_SEGMENTS = 4      # target number of separate val regions spread across each trial
 # ----------------------------------------------------------------------------
 
 

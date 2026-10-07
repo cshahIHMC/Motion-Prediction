@@ -19,7 +19,7 @@ class LN_v2(nn.Module):
         y = (x - mean) / std
         y = y * self.alpha + self.beta
         return y
-    
+
 class Model(nn.Module):
     def __init__(self, input_channels, embedding_channels, intermediate_channels, time_range, window):
         super(Model, self).__init__()
@@ -27,25 +27,73 @@ class Model(nn.Module):
         self.embedding_channels = embedding_channels
         self.time_range = time_range
         self.window = window
-        self.intermediate_channels = intermediate_channels
+
+        # intermediate_channels = int(input_channels/3)
+        #
+        # Accepts either a single int (ORIGINAL behaviour -- one hidden conv
+        # stage: input_channels -> intermediate_channels -> embedding_channels)
+        # or a list of ints (multiple CASCADED hidden stages, e.g. [10, 3]
+        # tapering input_channels=30 -> 10 -> 3 before the final conv up to
+        # embedding_channels) -- mirrors Models/FLD.py's own
+        # encoder_shape/decoder_shape list convention. A bare int is
+        # normalised to a length-1 list right away so everything below only
+        # ever deals with the list form; existing callers passing a single
+        # int are completely unaffected (same 2-conv-layer network as before).
+        if isinstance(intermediate_channels, int):
+            intermediate_channels = [intermediate_channels]
+        self.intermediate_channels = list(intermediate_channels)
 
         self.tpi = Parameter(torch.from_numpy(np.array([2.0*np.pi], dtype=np.float32)), requires_grad=False)
         self.args = Parameter(torch.from_numpy(np.linspace(-self.window/2, self.window/2, self.time_range, dtype=np.float32)), requires_grad=False)
         self.freqs = Parameter(torch.fft.rfftfreq(time_range)[1:] * time_range / self.window, requires_grad=False) #Remove DC frequency
 
-        # intermediate_channels = int(input_channels/3)
-        
-        self.conv1 = nn.Conv1d(input_channels, self.intermediate_channels, time_range, stride=1, padding=int((time_range - 1) / 2), dilation=1, groups=1, bias=True, padding_mode='zeros')
-        self.norm1 = LN_v2(time_range)
-        self.conv2 = nn.Conv1d(self.intermediate_channels, embedding_channels, time_range, stride=1, padding=int((time_range - 1) / 2), dilation=1, groups=1, bias=True, padding_mode='zeros')
+        conv_padding = int((time_range - 1) / 2)
+
+        # Encoder: input_channels -> intermediate_channels[0] -> ... ->
+        # intermediate_channels[-1] -> embedding_channels. Each hidden stage
+        # is Conv1d + LN_v2(time_range) + ELU (same trio the original single-
+        # stage version used); the FINAL stage is a plain Conv1d with no
+        # norm/activation after it -- `latent` (in forward()) is that raw
+        # conv output, exactly as before.
+        encoder_layers = []
+        curr_in = input_channels
+        for hidden in self.intermediate_channels:
+            encoder_layers.append(
+                nn.Conv1d(curr_in, hidden, time_range, stride=1, padding=conv_padding,
+                          dilation=1, groups=1, bias=True, padding_mode='zeros')
+            )
+            encoder_layers.append(LN_v2(time_range))
+            encoder_layers.append(nn.ELU())
+            curr_in = hidden
+        encoder_layers.append(
+            nn.Conv1d(curr_in, embedding_channels, time_range, stride=1, padding=conv_padding,
+                      dilation=1, groups=1, bias=True, padding_mode='zeros')
+        )
+        self.encoder = nn.Sequential(*encoder_layers)
 
         self.fc = torch.nn.ModuleList()
         for i in range(embedding_channels):
             self.fc.append(nn.Linear(time_range, 2))
 
-        self.deconv1 = nn.Conv1d(embedding_channels, self.intermediate_channels, time_range, stride=1, padding=int((time_range - 1) / 2), dilation=1, groups=1, bias=True, padding_mode='zeros')
-        self.denorm1 = LN_v2(time_range)
-        self.deconv2 = nn.Conv1d(self.intermediate_channels, input_channels, time_range, stride=1, padding=int((time_range - 1) / 2), dilation=1, groups=1, bias=True, padding_mode='zeros')
+        # Decoder mirrors the encoder in reverse: embedding_channels ->
+        # intermediate_channels[-1] -> ... -> intermediate_channels[0] ->
+        # input_channels. Same per-stage trio as the encoder; final stage is
+        # a plain Conv1d (no norm/activation), matching the original.
+        decoder_layers = []
+        curr_in = embedding_channels
+        for hidden in reversed(self.intermediate_channels):
+            decoder_layers.append(
+                nn.Conv1d(curr_in, hidden, time_range, stride=1, padding=conv_padding,
+                          dilation=1, groups=1, bias=True, padding_mode='zeros')
+            )
+            decoder_layers.append(LN_v2(time_range))
+            decoder_layers.append(nn.ELU())
+            curr_in = hidden
+        decoder_layers.append(
+            nn.Conv1d(curr_in, input_channels, time_range, stride=1, padding=conv_padding,
+                      dilation=1, groups=1, bias=True, padding_mode='zeros')
+        )
+        self.decoder = nn.Sequential(*decoder_layers)
 
     #Returns the frequency for a function over a time window in s
     def FFT(self, function, dim):
@@ -72,12 +120,7 @@ class Model(nn.Module):
 
         # y = y.reshape(y.shape[0], self.input_channels, self.time_range)
 
-
-        y = self.conv1(y)
-        y = self.norm1(y)
-        y = F.elu(y)
-
-        y = self.conv2(y)
+        y = self.encoder(y)
 
         latent = y #Save latent for returning
 
@@ -90,7 +133,7 @@ class Model(nn.Module):
             v = self.fc[i](y[:,i,:])
             p[:,i] = torch.atan2(v[:,1], v[:,0]) / self.tpi
 
-        #Parameters    
+        #Parameters
         p = p.unsqueeze(2)
         f = f.unsqueeze(2)
         a = a.unsqueeze(2)
@@ -103,18 +146,9 @@ class Model(nn.Module):
         signal = y #Save signal for returning
 
         #Signal Reconstruction
-        y = self.deconv1(y)
-        y = self.denorm1(y)
-        y = F.elu(y)
-
-        y = self.deconv2(y)
+        y = self.decoder(y)
 
         # y = y.reshape(y.shape[0], self.input_channels*self.time_range)
 
         # return y, latent, signal, params
         return params
-    
-
-
-
-

@@ -4,14 +4,33 @@ train_fld.py
 Training script for the FLD (Fourier Latent Dynamics) model applied to
 biomechanical sensor data, trained jointly across multiple recording
 sessions ("tasks"/trials). Tasks are discovered from Data/all_data.csv
-(built by combine_data.py -- every subject's trial CSVs stacked with a
-trial_id/subject_name/task column) -- no separate mapping file is used or
-needed.
+(built by combine_data.py's combine() -- every subject's trial CSVs stacked
+with a trial_id/subject_name/task column; the per-trial CSVs already carry
+10 joint angular-velocity columns, so combine() needs no separate
+velocity-computation step) -- no separate mapping file is used or needed.
 
 Input  = body acc (5x3=15) + body gyro (5x3=15) + insole acc (2x3=6) + insole gyro (2x3=6)
        + insole force/COP (L/R x 3 = 6) + subject weight + subject height  ->  50 features total
-Output = 10 joint angles (deg) + 10 joint moments (N.m/kg, each divided by
-         that row's own subject_weight -- see _load_all_data) = 20 features
+Output = 10 joint angles (deg) + 10 joint angular velocities (deg/s,
+         precomputed upstream in the per-trial CSVs) + 10 joint moments
+         (N.m/kg, each divided by that row's own subject_weight -- see
+         _load_all_data) = 30 features
+
+--------------------------------------------------------------------------
+OUTPUT_DIM changed 20 -> 30 -- checkpoint compatibility note
+--------------------------------------------------------------------------
+Checkpoints saved from here on have output_dim=30, not 20. Scripts that
+build their OWN independent OUTPUT_COLUMNS (plot_error_across_time.py,
+locomotion_index.py, impedance_from_latents.py, plot_phase_vs_insole.py --
+all still assume 20 outputs, not updated as part of this change) will fail
+LOUDLY with a PyTorch state_dict shape-mismatch error if pointed at a new
+30-output checkpoint, not silently misalign columns. train_sparse_fld.py
+DOES import OUTPUT_COLUMNS/OUTPUT_DIM/MODALITY_GROUPS/_load_all_data
+directly from this file, so it now trains 30-output sparse models too,
+automatically, without being edited itself. train_fld_angles_only.py and
+train_tcnn.py are fully independent copies (per this repo's "duplicate
+rather than share training-script internals" convention) and are
+unaffected either way.
 
 At 150 Hz, each training sample is a clean, disjoint split (history_horizon
 and forecast_horizon are config values -- H=151/K=50 shown below as an
@@ -65,7 +84,7 @@ from Library.fld_plotter import Plotter
 # ---------------------------------------------------------------------------
 
 DATA_DIR      = os.path.join(os.path.dirname(__file__), "Data")
-ALL_DATA_PATH = os.path.join(DATA_DIR, "all_data.csv")           # built by combine_data.py
+ALL_DATA_PATH = os.path.join(DATA_DIR, "all_data.csv")            # built by combine_data.py's combine()
 INDEX_PATH    = os.path.join(DATA_DIR, "train_val_index.csv")    # built by build_train_val_index.py
 
 # Input features — 48 wearable sensor channels
@@ -103,7 +122,8 @@ SUBJECT_COLUMNS = ['subject_weight', 'subject_height']
 # What actually gets fed to the encoder: wearable sensors + subject constants
 INPUT_COLUMNS = COLUMNS + SUBJECT_COLUMNS
 
-# Output features — 10 joint angles (°) + 10 joint moments (N·m/kg) = 20 features
+# Output features — 10 joint angles (°) + 10 joint angular velocities (°/s)
+# + 10 joint moments (N·m/kg) = 30 features
 OUTPUT_COLUMNS = [
     # Joint angles — degrees
     'hip_flexion_r',    'hip_flexion_l',
@@ -111,6 +131,13 @@ OUTPUT_COLUMNS = [
     'hip_rotation_r',   'hip_rotation_l',
     'knee_angle_r',     'knee_angle_l',
     'ankle_angle_r',    'ankle_angle_l',
+    # Joint angular velocities — degrees/second (precomputed upstream in the
+    # per-trial CSVs, carried through as-is by combine_data.py)
+    'hip_flexion_r_velocity',    'hip_flexion_l_velocity',
+    'hip_adduction_r_velocity',  'hip_adduction_l_velocity',
+    'hip_rotation_r_velocity',   'hip_rotation_l_velocity',
+    'knee_angle_r_velocity',     'knee_angle_l_velocity',
+    'ankle_angle_r_velocity',    'ankle_angle_l_velocity',
     # Joint moments — N·m/kg (raw N·m divided by subject_weight in _load_all_data,
     # so torque is reported per unit body mass and comparable across subjects)
     'hip_flexion_r_moment',   'hip_flexion_l_moment',
@@ -118,34 +145,39 @@ OUTPUT_COLUMNS = [
     'hip_rotation_r_moment',  'hip_rotation_l_moment',
     'knee_angle_r_moment',    'knee_angle_l_moment',
     'ankle_angle_r_moment',   'ankle_angle_l_moment',
-    # Total: 20 features
+    # Total: 30 features
 ]
-MOMENT_COLUMNS = OUTPUT_COLUMNS[10:]   # the 10 *_moment columns -- normalised by subject weight
+VELOCITY_COLUMNS = OUTPUT_COLUMNS[10:20]   # the 10 *_velocity columns
+MOMENT_COLUMNS   = OUTPUT_COLUMNS[20:]     # the 10 *_moment columns -- normalised by subject weight
 
 INPUT_DIM  = len(INPUT_COLUMNS)
 OUTPUT_DIM = len(OUTPUT_COLUMNS)
 
 # Output modality groups — for per-group RMSE logging and per-modality loss
-# weighting (config["weight_angle"] / config["weight_moment"]).
+# weighting (config["weight_angle"] / config["weight_velocity"] / config["weight_moment"]).
 MODALITY_GROUPS = {
-    "angle":  {"indices": list(range(0, 10)),  "unit": "°",      "label": "Joint Angle RMSE (°)"},
-    "moment": {"indices": list(range(10, 20)), "unit": "N·m/kg", "label": "Joint Moment RMSE (N·m/kg)"},
+    "angle":    {"indices": list(range(0, 10)),  "unit": "°",      "label": "Joint Angle RMSE (°)"},
+    "velocity": {"indices": list(range(10, 20)), "unit": "°/s",    "label": "Joint Velocity RMSE (°/s)"},
+    "moment":   {"indices": list(range(20, 30)), "unit": "N·m/kg", "label": "Joint Moment RMSE (N·m/kg)"},
 }
 
 
 # ---------------------------------------------------------------------------
-# Data loading — Data/all_data.csv (combine_data.py) + Data/train_val_index.csv
-# (build_train_val_index.py). Both must exist; run those scripts first if
-# either is missing.
+# Data loading — Data/all_data.csv (combine_data.py's combine()) +
+# Data/train_val_index.csv (build_train_val_index.py). Both must exist; run
+# those scripts first if either is missing.
 # ---------------------------------------------------------------------------
 
 def _load_all_data():
     """Read Data/all_data.csv and normalise joint moments to N·m/kg by
-    dividing each row's moment columns by that row's own subject_weight (kg)
-    -- so torque is reported per unit body mass instead of raw N·m, and is
-    comparable across subjects of different weight."""
+    dividing each row's moment columns by that row's own subject_weight
+    (kg) -- so torque is reported per unit body mass instead of raw N·m,
+    and is comparable across subjects of different weight."""
     if not os.path.exists(ALL_DATA_PATH):
-        raise FileNotFoundError(f"{ALL_DATA_PATH} not found -- run combine_data.py first.")
+        raise FileNotFoundError(
+            f"{ALL_DATA_PATH} not found -- run combine_data.py first "
+            f'(python3 -c "import combine_data; combine_data.combine()").'
+        )
     usecols = list(dict.fromkeys(['trial_id', 'subject_name', 'task'] + INPUT_COLUMNS + OUTPUT_COLUMNS))
     df = pd.read_csv(ALL_DATA_PATH, usecols=usecols)
     df[MOMENT_COLUMNS] = df[MOMENT_COLUMNS].div(df['subject_weight'], axis=0)
@@ -549,11 +581,13 @@ def train(config: dict):
     fig_loss,   ax_loss   = plt.subplots(figsize=(8, 4))
     # Per-channel latent parameter histograms
     fig_hist,   ax_hist   = plt.subplots(latent_dim, 4, figsize=(18, 3.5 * latent_dim))
-    # Long trajectory — split into angles and moments, one figure reused per task
-    _n_angles  = 10
-    _n_moments = 10
-    fig_long_angle,  ax_long_angle  = plt.subplots(_n_angles,  1, figsize=(30, 2.0 * _n_angles),  sharex=True)
-    fig_long_moment, ax_long_moment = plt.subplots(_n_moments, 1, figsize=(30, 2.0 * _n_moments), sharex=True)
+    # Long trajectory — split into angles, velocities, and moments, one figure reused per task
+    _n_angles     = 10
+    _n_velocities = 10
+    _n_moments    = 10
+    fig_long_angle,    ax_long_angle    = plt.subplots(_n_angles,     1, figsize=(30, 2.0 * _n_angles),     sharex=True)
+    fig_long_velocity, ax_long_velocity = plt.subplots(_n_velocities, 1, figsize=(30, 2.0 * _n_velocities), sharex=True)
+    fig_long_moment,   ax_long_moment   = plt.subplots(_n_moments,    1, figsize=(30, 2.0 * _n_moments),    sharex=True)
     # Per-task PCA phase manifold — one figure reused per task
     fig_task_pca, ax_task_pca = plt.subplots(figsize=(8, 8))
     # Latent sine curves — one row per latent channel, illustrative (first task)
@@ -679,28 +713,15 @@ def train(config: dict):
             valid = [i for i in group["indices"] if i < n_features]
             mod_rmse[modality] = feat_rmse[valid].mean().item() if valid else 0.0
 
-        # Cumulative per-feature RMSE, in original units: _feat_rmse_k(k_idx)
-        # averages squared error over every step from frame 1 through frame
-        # k_idx+1 (not just the single frame at k_idx+1), so e.g. the 500ms
-        # column is the average error across the WHOLE 0-500ms horizon, not
-        # just the error exactly at 500ms.
+        # Instantaneous per-feature RMSE, in original units: _feat_rmse_at_k(k_idx)
+        # is the error at exactly forecast step k_idx+1 (not averaged over
+        # 0..k_idx), so e.g. the 500ms column is the error AT 500ms, not the
+        # average error across the whole 0-500ms horizon.
         std_t = out_std_cpu.clamp(min=1e-6)
-        def _feat_rmse_k(k_idx):
+        def _feat_rmse_at_k(k_idx):
             k_idx = min(k_idx, pred_cat.shape[0] - 1)
-            err = (pred_cat[:k_idx + 1] - tgt_cat[:k_idx + 1]).pow(2).mean(dim=(0, 1)).sqrt()  # (F,)
+            err = (pred_cat[k_idx] - tgt_cat[k_idx]).pow(2).mean(dim=0).sqrt()  # (F,) -- mean over B only
             return (err * std_t).tolist()
-
-        feat_units = ([MODALITY_GROUPS["angle"]["unit"]] * 10
-                      + [MODALITY_GROUPS["moment"]["unit"]] * 10)   # 10 joint angles, 10 joint moments
-        # Nearest step (frame 1, ~7ms), then every 100ms out to forecast_horizon --
-        # adapts automatically if forecast_horizon changes, rather than always
-        # showing only the first few frames regardless of how far ahead we predict.
-        frames_per_100ms = round(150.0 * 0.1)   # 15 at 150 Hz
-        n_100ms_points   = forecast_horizon // frames_per_100ms
-        K_table    = [0] + [i * frames_per_100ms - 1 for i in range(1, n_100ms_points + 1)]
-        K_table    = [k for k in K_table if k < forecast_horizon]
-        ms_labels  = [f"0-{(k+1)/150*1000:.0f}ms avg" for k in K_table]
-        rmse_table = [_feat_rmse_k(k) for k in K_table]
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -716,21 +737,34 @@ def train(config: dict):
         mod_str = "  ".join(f"{k}={v:.3f}" for k, v in mod_rmse.items())
         print(f"          modality RMSE (orig units): {mod_str}")
 
-        # Per-feature RMSE table
-        col_w  = 22
-        cell_w = 14
-        header_row = f"          {'Feature':<{col_w}}" + "".join(f" {lbl:>{cell_w}}" for lbl in ms_labels)
-        sep    = f"          {'-'*col_w}" + "".join(f" {'-'*cell_w}" for _ in ms_labels)
-        print(header_row)
-        print(sep)
-        for fi, (name, unit) in enumerate(zip(OUTPUT_COLUMNS, feat_units)):
-            row_str = f"          {name[:col_w]:<{col_w}}"
-            for rmse_k in rmse_table:
-                row_str += f" {rmse_k[fi]:>{cell_w-2}.3f}{unit} "
-            print(row_str)
-
-        # All plots fire once at the end of training only
+        # All plots + the per-feature RMSE table fire once at the end of
+        # training only -- both were previously printed/redrawn every epoch.
         if epoch == config["epochs"] - 1:
+            feat_units = ([MODALITY_GROUPS["angle"]["unit"]] * 10
+                          + [MODALITY_GROUPS["velocity"]["unit"]] * 10
+                          + [MODALITY_GROUPS["moment"]["unit"]] * 10)   # 10 angles, 10 velocities, 10 moments
+            # Nearest step (frame 1, ~7ms), then every 100ms out to forecast_horizon --
+            # adapts automatically if forecast_horizon changes, rather than always
+            # showing only the first few frames regardless of how far ahead we predict.
+            frames_per_100ms = round(150.0 * 0.1)   # 15 at 150 Hz
+            n_100ms_points   = forecast_horizon // frames_per_100ms
+            K_table    = [0] + [i * frames_per_100ms - 1 for i in range(1, n_100ms_points + 1)]
+            K_table    = [k for k in K_table if k < forecast_horizon]
+            ms_labels  = [f"@{(k+1)/150*1000:.0f}ms" for k in K_table]
+            rmse_table = [_feat_rmse_at_k(k) for k in K_table]
+
+            col_w  = 22
+            cell_w = 14
+            header_row = f"          {'Feature':<{col_w}}" + "".join(f" {lbl:>{cell_w}}" for lbl in ms_labels)
+            sep    = f"          {'-'*col_w}" + "".join(f" {'-'*cell_w}" for _ in ms_labels)
+            print(header_row)
+            print(sep)
+            for fi, (name, unit) in enumerate(zip(OUTPUT_COLUMNS, feat_units)):
+                row_str = f"          {name[:col_w]:<{col_w}}"
+                for rmse_k in rmse_table:
+                    row_str += f" {rmse_k[fi]:>{cell_w-2}.3f}{unit} "
+                print(row_str)
+
             with torch.no_grad():
                 model.eval()
                 _plot_loss_curve(fig_loss, ax_loss, train_losses, val_losses,
@@ -776,10 +810,19 @@ def train(config: dict):
                     )
                     _plot_long_trajectory(
                         model, task_ds, device,
-                        history_horizon, fig_long_moment, ax_long_moment,
+                        history_horizon, fig_long_velocity, ax_long_velocity,
                         n_blocks=225, forecast_horizon=forecast_horizon, block_step=20,
                         sample_rate=150.0, epoch=epoch,
                         start_frame=run_start, max_frame=run_end, feature_slice=slice(10, 20),
+                        task_label=f"{trial_id} ({info['label']})",
+                        save_path=os.path.join(plots_dir, f"{prefix}_future_pred_velocities.png"),
+                    )
+                    _plot_long_trajectory(
+                        model, task_ds, device,
+                        history_horizon, fig_long_moment, ax_long_moment,
+                        n_blocks=225, forecast_horizon=forecast_horizon, block_step=20,
+                        sample_rate=150.0, epoch=epoch,
+                        start_frame=run_start, max_frame=run_end, feature_slice=slice(20, 30),
                         task_label=f"{trial_id} ({info['label']})",
                         save_path=os.path.join(plots_dir, f"{prefix}_future_pred_moments.png"),
                     )
@@ -1148,7 +1191,8 @@ def _plot_long_trajectory(model, dataset, device,
     predictions for the same stretch layered on top of each other.
 
     feature_slice: slice object selecting which output features to plot,
-                   e.g. slice(0,10) for angles, slice(10,20) for moments.
+                   e.g. slice(0,10) for angles, slice(10,20) for velocities,
+                   slice(20,30) for moments.
     Blue = ground truth (drawn once).  Red dashed = one prediction per block.
     """
     if block_step is None:
@@ -1199,11 +1243,13 @@ def _plot_long_trajectory(model, dataset, device,
     gt_plot   = gt_full[:, fs]
     col_names = OUTPUT_COLUMNS[fs] if feature_slice is not None else OUTPUT_COLUMNS
     all_units = ([MODALITY_GROUPS["angle"]["unit"]] * 10
+                + [MODALITY_GROUPS["velocity"]["unit"]] * 10
                 + [MODALITY_GROUPS["moment"]["unit"]] * 10)
     units_plot = (all_units[fs] if isinstance(fs, slice)
                   else [all_units[i] for i in fs])
     group_label = ("Joint Angles (°)" if feature_slice == slice(0, 10)
-                   else f"Joint Moments ({MODALITY_GROUPS['moment']['unit']})" if feature_slice == slice(10, 20)
+                   else f"Joint Velocities ({MODALITY_GROUPS['velocity']['unit']})" if feature_slice == slice(10, 20)
+                   else f"Joint Moments ({MODALITY_GROUPS['moment']['unit']})" if feature_slice == slice(20, 30)
                    else "Output Features")
 
     overlapping = block_step < K
@@ -1272,18 +1318,19 @@ def main():
         "forecast_horizon": 50,     # ~0.5 s ahead at 150 Hz
         "latent_dim": 8,             # Fourier latent channels — increased for cross-modal task
         "encoder_shape": [128, 64],   # larger encoder to handle 48→8 cross-modal compression
-        "decoder_shape": [64, 128],   # larger decoder to expand 8→20 joint outputs
-        "feature_set": "cross",      # input: 48 IMU/insole cols → output: 20 joint angle+moment cols
+        "decoder_shape": [64, 128],   # larger decoder to expand 8→30 joint outputs
+        "feature_set": "cross",      # input: 48 IMU/insole cols → output: 30 joint angle+velocity+moment cols
         # Loss settings
-        "gamma":        0.95,        # horizon discount
-        "weight_angle":  1.0,        # relative weight for joint angles (°)
-        "weight_moment": 1.0,        # relative weight for joint moments (N·m/kg)
-        "batch_size": 256,           # dataset fits on GPU — large batches keep it fed
+        "gamma":          0.95,        # horizon discount
+        "weight_angle":    1.0,        # relative weight for joint angles (°)
+        "weight_velocity": 1.0,        # relative weight for joint angular velocities (°/s)
+        "weight_moment":   1.0,        # relative weight for joint moments (N·m/kg)
+        "batch_size": 512,           # dataset fits on GPU — large batches keep it fed
         "num_workers": 4,            # only used when data can't live on GPU (CPU fallback)
         "lr": 1e-4,
         "weight_decay": 5e-4,
         "noise_level": 0.05,
-        "epochs": 80,
+        "epochs": 30,
         "save_every": 10,
         "use_amp": True,             # bf16 autocast on CUDA
         "compile_model": True,       # torch.compile, falls back to eager on failure

@@ -4,8 +4,7 @@ train_tcnn.py
 Training script for a baseline Temporal Convolutional Network (TCN) direct
 motion predictor, trained jointly across multiple recording sessions
 ("tasks"/trials). Mirrors train_fld.py's data pipeline (task discovery from
-Data/all_data.csv, train/val window-start index from
-Data/train_val_index.csv, pooled global normalisation, same input/output
+Data/all_data_150_corrected.csv, pooled global normalisation, same input/output
 columns) but swaps the FLD phase-based model for TCNModel_Forecast, a plain
 causal-dilated-conv backbone with a linear head that predicts the whole
 forecast horizon in one forward pass.
@@ -28,22 +27,20 @@ example, current config may differ, see main()):
                      in one shot by the linear head (see TCNModel_Forecast).
 
 Each trial's rows are its own contiguous recording. Context/future pairs are
-built per-trial and never cross a trial boundary. Train/val window starts
-come from Data/train_val_index.csv (built by build_train_val_index.py):
-each trial's rows are split ~85/15, with val spread across a few segments
-through the trial (not just the tail) and a window_size gap enforced around
-every train/val boundary so no window pair leaks across the split. A global
-normalisation is fit on the pooled training rows across all tasks (excluding
-any row a validation window reads -- see _norm_stats_mask) so every task
-shares one input/output scale. Unlike train_fld.py, no latent-space/
-phase-manifold diagnostics are produced here (there's no latent space to
-inspect) -- only the loss curve and the per-task future-prediction
-trajectory plots are saved, drawn from each task's largest validation
-segment.
+built per-trial and never cross a trial boundary.
+
+Train/val is LEAVE-SUBJECT-OUT -- no train_val_index CSV is read. TRAIN uses every
+window (stride 1) of every trial in TRAIN_DATA_PATH (Data/all_data_150_corrected.csv,
+S01-S04); VALIDATION uses every window of every trial in VAL_DATA_PATH
+(Data/all_data_S05_150_corrected.csv, subject S05 -- never trained on). The two files
+must hold disjoint subjects (ValueError otherwise). A global normalisation is fit on
+the pooled TRAIN rows across all tasks, so every task (and the held-out subject) shares
+one input/output scale. Unlike train_fld.py, no latent-space/phase-manifold diagnostics
+are produced here (there's no latent space to inspect) -- only the loss curve and the
+per-trial future-prediction trajectory plots (one per held-out S05 trial) are saved.
 
 Run:
     python3 combine_data.py            # once, or after adding trials/subjects
-    python3 build_train_val_index.py   # once, or after the above changes
     python3 train_tcnn.py
 """
 
@@ -52,7 +49,7 @@ import sys
 import torch
 import torch.optim as optim
 import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader, Subset, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset
 import pandas as pd
 from datetime import datetime
 import numpy as np
@@ -67,8 +64,8 @@ from Models.TCNN import TCNModel_Forecast
 # ---------------------------------------------------------------------------
 
 DATA_DIR      = os.path.join(os.path.dirname(__file__), "Data")
-ALL_DATA_PATH = os.path.join(DATA_DIR, "all_data.csv")           # built by combine_data.py
-INDEX_PATH    = os.path.join(DATA_DIR, "train_val_index.csv")    # built by build_train_val_index.py
+TRAIN_DATA_PATH = os.path.join(DATA_DIR, "all_data_150_corrected.csv")      # TRAIN: S01-S04 (combine_data.py, 150 Hz, corrected)
+VAL_DATA_PATH   = os.path.join(DATA_DIR, "all_data_S05_150_corrected.csv")  # VALIDATION: held-out subject S05, never trained on
 
 # Input features — 48 wearable sensor channels
 COLUMNS = [
@@ -97,7 +94,7 @@ COLUMNS = [
 ]
 
 # Subject-specific constants — same value repeated on every row of a given
-# trial's CSV. Now that Data/all_data.csv pools multiple subjects (S01, S02,
+# trial's CSV. Now that Data/all_data_150_corrected.csv pools multiple subjects (S01, S02,
 # ...) with genuinely different weight/height, these carry real signal —
 # they let the TCN condition its output on who's wearing the sensors.
 SUBJECT_COLUMNS = ['subject_weight', 'subject_height']
@@ -136,20 +133,19 @@ MODALITY_GROUPS = {
 
 
 # ---------------------------------------------------------------------------
-# Data loading — Data/all_data.csv (combine_data.py) + Data/train_val_index.csv
-# (build_train_val_index.py). Both must exist; run those scripts first if
-# either is missing.
+# Data loading -- TRAIN_DATA_PATH / VAL_DATA_PATH (combine_data.py). No
+# train_val_index: train = the whole train file, val = the whole held-out file.
 # ---------------------------------------------------------------------------
 
-def _load_all_data():
-    """Read Data/all_data.csv and normalise joint moments to N·m/kg by
+def _load_all_data(data_path):
+    """Read an all_data*.csv and normalise joint moments to N·m/kg by
     dividing each row's moment columns by that row's own subject_weight (kg)
     -- so torque is reported per unit body mass instead of raw N·m, and is
     comparable across subjects of different weight."""
-    if not os.path.exists(ALL_DATA_PATH):
-        raise FileNotFoundError(f"{ALL_DATA_PATH} not found -- run combine_data.py first.")
-    usecols = list(dict.fromkeys(['trial_id', 'task'] + INPUT_COLUMNS + OUTPUT_COLUMNS))
-    df = pd.read_csv(ALL_DATA_PATH, usecols=usecols)
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"{data_path} not found -- run combine_data.py first.")
+    usecols = list(dict.fromkeys(['trial_id', 'subject_name', 'task'] + INPUT_COLUMNS + OUTPUT_COLUMNS))
+    df = pd.read_csv(data_path, usecols=usecols)
     df[MOMENT_COLUMNS] = df[MOMENT_COLUMNS].div(df['subject_weight'], axis=0)
     return df
 
@@ -168,55 +164,24 @@ def _discover_tasks(all_df):
     return tasks
 
 
-def _load_split_index(window_size):
-    """trial_id -> {'train': [local_start_idx...], 'val': [local_start_idx...]},
-    from Data/train_val_index.csv (build_train_val_index.py). Verifies the
-    index was built for a window at least as large as window_size -- a CSV
-    built for a bigger window is safe to reuse (its gaps/trial-boundary
-    margins are only more conservative), but one built for a smaller window
-    could let a window here spill past a trial boundary or the leakage gap."""
-    if not os.path.exists(INDEX_PATH):
-        raise FileNotFoundError(f"{INDEX_PATH} not found -- run build_train_val_index.py first.")
-    idx_df = pd.read_csv(INDEX_PATH, usecols=['trial_id', 'split', 'local_start_idx', 'window_size'])
-    index_window_size = int(idx_df['window_size'].min())
-    if index_window_size < window_size:
-        raise ValueError(
-            f"{INDEX_PATH} was built for window_size={index_window_size}, smaller than this "
-            f"script's window_size={window_size} -- rerun build_train_val_index.py with "
-            f"HISTORY_HORIZON/FORECAST_HORIZON matching (or exceeding) this config first."
+def _build_trial_datasets(df, task_info_by_trial, history_horizon, forecast_horizon, norm_stats, data_device):
+    """{trial_id: {'label', 'dataset'}} -- one TCNNDataset per trial in `df` (file order),
+    every window (stride 1) usable. Trials too short for a single window are skipped."""
+    out = {}
+    for trial_id, g in df.groupby('trial_id', sort=False):
+        trial_df = g[INPUT_COLUMNS + OUTPUT_COLUMNS].reset_index(drop=True)
+        dataset = TCNNDataset(
+            trial_df, history_horizon=history_horizon, forecast_horizon=forecast_horizon,
+            norm_stats=norm_stats, device=data_device, input_dim=INPUT_DIM,
         )
-    splits = {}
-    for trial_id, g in idx_df.groupby('trial_id', sort=False):
-        splits[trial_id] = {
-            'train': g.loc[g['split'] == 'train', 'local_start_idx'].tolist(),
-            'val':   g.loc[g['split'] == 'val',   'local_start_idx'].tolist(),
-        }
-    return splits
-
-
-def _val_runs(val_local_starts, window_size):
-    """Group a trial's val local_start_idx values into contiguous stride-1
-    runs -- one run per val segment placed by build_train_val_index.py.
-    Returns list of (run_start, raw_row_end) tuples, raw_row_end being one
-    past the last raw row any window in that run reads."""
-    if not val_local_starts:
-        return []
-    starts = np.sort(np.asarray(val_local_starts))
-    breaks = np.flatnonzero(np.diff(starts) > 1)
-    run_starts = np.r_[starts[0], starts[breaks + 1]]
-    run_ends   = np.r_[starts[breaks], starts[-1]]
-    return [(int(rs), int(re) + window_size) for rs, re in zip(run_starts, run_ends)]
-
-
-def _norm_stats_mask(trial_length, val_local_starts, window_size):
-    """Boolean mask over a trial's raw rows: True for rows usable when
-    fitting normalisation statistics. Excludes exactly the rows any
-    validation window reads (context or future), so val never leaks into the
-    fitted train normalisation -- see _val_runs."""
-    mask = np.ones(trial_length, dtype=bool)
-    for rs, re in _val_runs(val_local_starts, window_size):
-        mask[rs:re] = False
-    return mask
+        if len(dataset) <= 0:
+            print(f"[TCNN] {trial_id}: {len(trial_df)} rows < window_size={dataset.window_size}, skipping.")
+            continue
+        info = task_info_by_trial[trial_id]
+        out[trial_id] = {"label": info['label'], "dataset": dataset}
+        print(f"[TCNN] {trial_id} ({info['label']}): {len(trial_df):,} rows ({len(trial_df)/150:.1f}s @150Hz)  "
+              f"windows={len(dataset):,}  subject={info['weight']:.1f}kg/{info['height']:.0f}cm")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -311,84 +276,45 @@ def train(config: dict):
     forecast_horizon = config["forecast_horizon"]
     window_size = history_horizon + forecast_horizon
 
-    # ---- Discover every task from Data/all_data.csv, load the pre-built ------
-    # ---- train/val window-start index -----------------------------------------
-    all_df      = _load_all_data()
-    discovered  = _discover_tasks(all_df)
-    task_labels = {tid: info['label'] for tid, info in discovered.items()}
-    split_index = _load_split_index(window_size)
-    print(f"[TCNN] Discovered {len(task_labels)} tasks in {ALL_DATA_PATH}: {task_labels}")
+    # ---- Leave-subject-out: TRAIN = every window of TRAIN_DATA_PATH, VAL = every window of
+    # ---- VAL_DATA_PATH (held-out subject). No train_val_index. ----------------------------
+    train_df = _load_all_data(TRAIN_DATA_PATH)
+    val_df   = _load_all_data(VAL_DATA_PATH)
+    overlap = set(train_df['subject_name'].unique()) & set(val_df['subject_name'].unique())
+    if overlap:
+        raise ValueError(f"Subjects {sorted(overlap)} appear in BOTH {TRAIN_DATA_PATH} and "
+                         f"{VAL_DATA_PATH} -- not a leave-subject-out split.")
+    train_tasks = _discover_tasks(train_df)
+    val_tasks   = _discover_tasks(val_df)
+    print(f"[TCNN] Train: {len(train_tasks)} trials in {TRAIN_DATA_PATH} "
+          f"(subjects {sorted(train_df['subject_name'].unique())})")
+    print(f"[TCNN] Val:   {len(val_tasks)} trials in {VAL_DATA_PATH} "
+          f"(held-out subjects {sorted(val_df['subject_name'].unique())})")
 
-    task_dfs = {}
-    train_raw_in, train_raw_out = [], []
-    for trial_id, g in all_df.groupby('trial_id', sort=False):
-        df = g[INPUT_COLUMNS + OUTPUT_COLUMNS].reset_index(drop=True)
-        task_dfs[trial_id] = df
-        if trial_id not in split_index:
-            raise ValueError(f"{trial_id}: not present in {INDEX_PATH} -- rerun build_train_val_index.py")
-        val_local = split_index[trial_id]['val']
-        mask = _norm_stats_mask(len(df), val_local, window_size)
-        train_raw_in.append(df.loc[mask, INPUT_COLUMNS].values.astype('float32'))
-        train_raw_out.append(df.loc[mask, OUTPUT_COLUMNS].values.astype('float32'))
-        info = discovered[trial_id]
-        n_train_win = len(split_index[trial_id]['train'])
-        n_val_win   = len(split_index[trial_id]['val'])
-        print(f"[TCNN] {trial_id} ({task_labels[trial_id]}): {len(df):,} rows "
-              f"({len(df)/150:.1f}s @150Hz)  train_windows={n_train_win:,}  val_windows={n_val_win:,}  "
-              f"subject={info['weight']:.1f}kg/{info['height']:.0f}cm")
-
-    # Global normalisation fit on TRAIN rows only, pooled across all tasks.
-    raw_in_all  = np.concatenate(train_raw_in,  axis=0)
-    raw_out_all = np.concatenate(train_raw_out, axis=0)
+    # Global normalisation fit on ALL train rows only (val rows never touch it), pooled across tasks.
+    raw_in_all  = train_df[INPUT_COLUMNS].values.astype('float32')
+    raw_out_all = train_df[OUTPUT_COLUMNS].values.astype('float32')
     mean_in,  std_in  = raw_in_all.mean(axis=0),  raw_in_all.std(axis=0)
     mean_out, std_out = raw_out_all.mean(axis=0), raw_out_all.std(axis=0)
     std_in[std_in == 0]   = 1.0
     std_out[std_out == 0] = 1.0
     norm_stats  = {'mean_in': mean_in, 'std_in': std_in, 'mean_out': mean_out, 'std_out': std_out}
     out_std_cpu = torch.tensor(std_out, dtype=torch.float32)
+    del raw_in_all, raw_out_all
 
-    # ---- Per-task TCNNDataset — windows are built within one file only -------
-    task_info = {}
-    train_subsets, val_subsets = [], []
-    for trial_id, label in task_labels.items():
-        df = task_dfs[trial_id]   # already ordered INPUT_COLUMNS + OUTPUT_COLUMNS
-        dataset = TCNNDataset(
-            df,
-            history_horizon=history_horizon,
-            forecast_horizon=forecast_horizon,
-            norm_stats=norm_stats,
-            device=data_device,
-            input_dim=INPUT_DIM,
-        )
-        train_idx = split_index[trial_id]['train']
-        val_idx   = split_index[trial_id]['val']
-        if not train_idx or not val_idx:
-            raise ValueError(
-                f"{trial_id}: missing train or val windows in {INDEX_PATH} "
-                f"(train={len(train_idx)}, val={len(val_idx)})"
-            )
+    # ---- Per-trial TCNNDataset -- windows are built within one trial only ----------------
+    train_trials = _build_trial_datasets(train_df, train_tasks, history_horizon, forecast_horizon, norm_stats, data_device)
+    task_info    = _build_trial_datasets(val_df,   val_tasks,   history_horizon, forecast_horizon, norm_stats, data_device)
+    if not train_trials or not task_info:
+        raise ValueError(f"No usable windows (train trials={len(train_trials)}, val trials={len(task_info)}).")
+    del train_df, val_df
 
-        train_subset = Subset(dataset, train_idx)
-        val_subset   = Subset(dataset, val_idx)
-        train_subsets.append(train_subset)
-        val_subsets.append(val_subset)
+    task_ids = list(task_info.keys())   # held-out trials, used for the end-of-training plots
 
-        task_info[trial_id] = {
-            "label": label,
-            "dataset": dataset,
-            # scattered val window starts, replacing the old single val_start
-            # (val is no longer one contiguous tail region) -- long-trajectory
-            # plots below use the largest contiguous run of these.
-            "val_runs": _val_runs(val_idx, window_size),
-        }
-        print(f"[TCNN] {trial_id} windows -> train={len(train_subset):,}  val={len(val_subset):,}")
-
-    task_ids = list(task_labels.keys())
-
-    train_dataset = ConcatDataset(train_subsets)
-    val_dataset   = ConcatDataset(val_subsets)
-    print(f"[TCNN] Combined: {len(train_dataset):,} train windows, {len(val_dataset):,} val windows "
-          f"across {len(task_ids)} tasks")
+    train_dataset = ConcatDataset([t["dataset"] for t in train_trials.values()])
+    val_dataset   = ConcatDataset([t["dataset"] for t in task_info.values()])
+    print(f"[TCNN] Combined: {len(train_dataset):,} train windows across {len(train_trials)} trials, "
+          f"{len(val_dataset):,} val windows across {len(task_info)} held-out trials")
 
     loader_kwargs = dict(num_workers=num_workers, pin_memory=(data_device is None))
     if num_workers > 0:
@@ -442,7 +368,7 @@ def train(config: dict):
     fig_long_moment, ax_long_moment = plt.subplots(_n_moments, 1, figsize=(30, 2.0 * _n_moments), sharex=True)
 
     train_losses, val_losses = [], []
-    diag_k = [9, 24, forecast_horizon - 1]   # horizon steps to log (0-indexed)
+    diag_k = sorted({min(9, forecast_horizon - 1), min(24, forecast_horizon - 1), forecast_horizon - 1})   # horizon steps to log (0-indexed), clipped to the horizon
 
     # ---- Training loop -------------------------------------------------------
     train_start = datetime.now()
@@ -542,15 +468,11 @@ def train(config: dict):
                 _plot_loss_curve(fig_loss, ax_loss, train_losses, val_losses,
                                  save_path=os.path.join(log_dir, "loss_curve.png"))
 
-                # --- Per-task future-prediction trajectory plots -----------------
-                # Val is now spread across a few segments per trial (see
-                # build_train_val_index.py), not one contiguous tail -- this
-                # plot needs a single contiguous stretch, so use the largest
-                # val run and bound reads to its own extent (max_frame).
+                # --- Per-trial future-prediction trajectory plots, one per HELD-OUT
+                # trial, from the start of each trial. -----------------------
                 for trial_id in task_ids:
                     info        = task_info[trial_id]
                     task_ds     = info["dataset"]
-                    run_start, run_end = max(info["val_runs"], key=lambda r: r[1] - r[0])
                     label_safe  = info["label"].replace("/", "-").replace(" ", "_")
                     prefix      = f"{trial_id}_{label_safe}"
 
@@ -559,7 +481,7 @@ def train(config: dict):
                         history_horizon, fig_long_angle, ax_long_angle,
                         n_blocks=225, forecast_horizon=forecast_horizon, block_step=20,
                         sample_rate=150.0, epoch=epoch,
-                        start_frame=run_start, max_frame=run_end, feature_slice=slice(0, 10),
+                        start_frame=0, feature_slice=slice(0, 10),
                         task_label=f"{trial_id} ({info['label']})",
                         save_path=os.path.join(plots_dir, f"{prefix}_future_pred_angles.png"),
                     )
@@ -568,7 +490,7 @@ def train(config: dict):
                         history_horizon, fig_long_moment, ax_long_moment,
                         n_blocks=225, forecast_horizon=forecast_horizon, block_step=20,
                         sample_rate=150.0, epoch=epoch,
-                        start_frame=run_start, max_frame=run_end, feature_slice=slice(10, 20),
+                        start_frame=0, feature_slice=slice(10, 20),
                         task_label=f"{trial_id} ({info['label']})",
                         save_path=os.path.join(plots_dir, f"{prefix}_future_pred_moments.png"),
                     )
@@ -762,7 +684,7 @@ def main():
     config = {
         # Data: every Data/trial_*_all_data.csv, each split 80/20 chronologically
         "history_horizon": 150,      # ~1.0 s of context at 150 Hz
-        "forecast_horizon": 50,      # ~0.5 s ahead at 150 Hz
+        "forecast_horizon": 30,      # ~0.2 s ahead at 150 Hz (150 + 30 = 180 must be <= index CSV's window_size)
         "num_channels": [80, 80, 80, 80, 80],   # TCN hidden channels per level
         "kernel_size": 6,
         "dropout": 0.2,
@@ -770,7 +692,7 @@ def main():
         "gamma":        0.95,        # horizon discount
         "weight_angle":  1.0,        # relative weight for joint angles (°)
         "weight_moment": 1.0,        # relative weight for joint moments (N·m/kg)
-        "batch_size": 256,           # dataset fits on GPU — large batches keep it fed
+        "batch_size": 512,           # dataset fits on GPU — large batches keep it fed
         "num_workers": 4,            # only used when data can't live on GPU (CPU fallback)
         "lr": 1e-4,
         # 0.0, not FLD's 5e-4: every TCN layer is weight_norm-parametrized
@@ -786,7 +708,7 @@ def main():
         # shrinking). FLD has no weight_norm anywhere so it doesn't hit this.
         "weight_decay": 0.0,
         "noise_level": 0.05,
-        "epochs": 1,
+        "epochs": 80,
         "save_every": 10,
         "use_amp": True,             # bf16 autocast on CUDA
         "compile_model": True,       # torch.compile, falls back to eager on failure

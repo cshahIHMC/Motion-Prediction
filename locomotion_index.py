@@ -84,7 +84,7 @@ FLD_RUN  = ""              # blank = latest FLD run under runs/FLD_*
 # is sit_stand_squat_transitions -- an actual stand/squat trial (the old
 # "trial_10" default here predates the subject-prefixed naming and its
 # "walking_1_2_m_s" comment was already stale relative to the current data).
-TRIAL_ID = "S01_trial_10"
+TRIAL_ID = "S01_trial_3"
 
 # Known-segment spot-check (see main()'s "SQUAT/STANDING SEGMENT DIAGNOSTICS" block):
 # indices are into the WINDOW/latent axis (A/f/c, length T), not raw CSV rows.

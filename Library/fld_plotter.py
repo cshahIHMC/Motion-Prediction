@@ -9,13 +9,13 @@ class Plotter:
     def __init__(self) -> None:
         self.pca = PCA(n_components=2)
 
-    def plot_pca(self, ax, manifold_collection, title=None, point_color=None, draw_line=True, draw_arrow=True):
+    def plot_pca(self, ax, manifold_collection, title=None, point_color=None, draw_line=True, draw_arrow=True,
+                 arrow_step=50):
         ax.cla()
 
         point_alpha = 0.3
         line_alpha = 0.2
         arrow_alpha = 1.0
-        arrow_step = 50
         arrow_size = 0.015
         arrow_power = 1.0
         arrow_color = (0.25, 0.25, 0.5)

@@ -12,13 +12,20 @@ class FLD(nn.Module):
                  dt=0.02,
                  encoder_shape=None,
                  decoder_shape=None,
+                 use_positional_encoding=False,
                  **kwargs,
                  ):
         if kwargs:
             print("FLD.__init__ got unexpected arguments, which will be ignored: "
                   + str([key for key in kwargs.keys()]))
         super(FLD, self).__init__()
-        self.input_channel = observation_dim
+        # use_positional_encoding=False (default) reproduces the exact prior
+        # behaviour/shapes for every existing caller -- nothing is broken by
+        # this addition unless a caller opts in explicitly. See
+        # fld_sparse_dataset.py / train_sparse_fld.py for the one that does.
+        self.use_positional_encoding = use_positional_encoding
+        self.observation_dim = observation_dim
+        self.input_channel = observation_dim + (1 if use_positional_encoding else 0)
         self.output_channel = output_dim if output_dim is not None else observation_dim
         self.history_horizon = history_horizon
         self.latent_channel = latent_channel
@@ -91,8 +98,25 @@ class FLD(nn.Module):
         )
         self.decoder = nn.Sequential(*decoder_layers).to(self.device)
 
-    def forward(self, x, k=1):
+    def forward(self, x, k=1, time_indices=None):
         # x: (batch_size, obs_dim, history_horizon)
+        # time_indices: optional (batch_size, history_horizon) positional encoding
+        #   (e.g. normalised lookback-time-per-slot from a non-uniform/sparse
+        #   sampling scheme). Ignored entirely unless use_positional_encoding
+        #   was set at construction time -- ordinary (observation_dim,
+        #   history_horizon) callers are completely unaffected.
+        #
+        # IMPORTANT CAVEAT: concatenating this as an extra encoder input
+        # channel gives the network raw information about each slot's true
+        # sample time, but does NOT itself make the FFT-based frequency/phase
+        # extraction below (self.args, self.freqs, torch.fft.rfft) correct for
+        # non-uniformly-spaced input -- that machinery still assumes H
+        # uniformly-spaced samples regardless of what time_indices says. See
+        # the chat note in train_sparse_fld.py's module docstring.
+        if self.use_positional_encoding:
+            if time_indices is None:
+                time_indices = torch.zeros(x.size(0), x.size(2), device=x.device, dtype=x.dtype)
+            x = torch.cat([x, time_indices.unsqueeze(1)], dim=1)  # (B, obs_dim+1, H)
         x = self.encoder(x)
         latent = x  # (batch_size, latent_channel, history_horizon)
 
@@ -135,13 +159,17 @@ class FLD(nn.Module):
 
     def fft(self, x):
         # x: (batch_size, latent_channel, history_horizon)
-        rfft = torch.fft.rfft(x, dim=2)
-        magnitude = rfft.abs()
-        spectrum = magnitude[:, :, 1:]  # remove DC bin
-        power = torch.square(spectrum)
-        frequency = torch.sum(self.freqs * power, dim=2) / (torch.sum(power, dim=2) + 1e-8)
-        amplitude = 2 * torch.sqrt(torch.sum(power, dim=2)) / self.history_horizon
-        offset = rfft.real[:, :, 0] / self.history_horizon
+        # torch.fft.rfft has no bf16/fp16 kernel, so this must run in fp32
+        # regardless of an enclosing autocast context.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            rfft = torch.fft.rfft(x, dim=2)
+            magnitude = rfft.abs()
+            spectrum = magnitude[:, :, 1:]  # remove DC bin
+            power = torch.square(spectrum)
+            frequency = torch.sum(self.freqs * power, dim=2) / (torch.sum(power, dim=2) + 1e-8)
+            amplitude = 2 * torch.sqrt(torch.sum(power, dim=2)) / self.history_horizon
+            offset = rfft.real[:, :, 0] / self.history_horizon
         return frequency, amplitude, offset
 
     def get_dynamics_error(self, state_transitions, k):
